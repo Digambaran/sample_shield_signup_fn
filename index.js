@@ -4,55 +4,64 @@ import { createTransport } from "nodemailer";
 import { hashSync } from "bcrypt";
 
 env.init();
-async function sendMail({ emailTo, subject, Text, html }) {
-  try {
-    const mailer = process.env.shield_mailer_email;
-    const password = process.env.SAMPLE_SHIELD_SIGNUP_FN_SHIELD_MAILER_PASSWORD;
-    const host = process.env.SAMPLE_SHIELD_SIGNUP_FN_SHIELD_MAILER_HOST;
-    const port = process.env.SAMPLE_SHIELD_SIGNUP_FN_SHIELD_MAILER_PORT;
 
-    let transporter = createTransport({
-      host,
-      port,
-      secure: port === 465, // true for 465, false for other ports
-      auth: { user: mailer, pass: password },
-    });
+async function sendMail({ to, subject, text, html }) {
+  const from = process.env.SAMPLE_SHIELD_SIGNUP_FN_SHIELD_MAILER_EMAIL;
+  const password = process.env.SAMPLE_SHIELD_SIGNUP_FN_SHIELD_MAILER_PASSWORD;
+  const host = process.env.SAMPLE_SHIELD_SIGNUP_FN_SHIELD_MAILER_HOST;
+  const port = process.env.SAMPLE_SHIELD_SIGNUP_FN_SHIELD_MAILER_PORT;
 
-    let info = await transporter.sendMail({
-      from: mailer,
-      to: emailTo,
-      subject,
-      text: Text,
-      html,
-    });
+  const transporter = createTransport({
+    host,
+    port,
+    secure: port === 465, // true for 465, false for other ports
+    auth: { user: from, pass: password },
+  });
 
-    if (!info) return new Error("Email not sent");
-    return info;
-  } catch (error) {
-    return error;
-  }
+  console.log(`to:${to}`);
+  console.log(`from:${from}`);
+  console.log(`html:${html}`);
+  console.log(`text:${text}`);
+  console.log(`subject:${subject}`);
+
+  const info = await transporter.sendMail({
+    from,
+    to,
+    subject,
+    text,
+    html,
+  });
+
+  console.log("info");
+  console.log(info);
+  if (!info) throw new Error("Email not sent");
+  return info;
 }
+
+/**
+ *
+ * @returns {{email_verification_code:string,email_verification_expiry:timestamp}}
+ */
 const generateOTP = () => {
+  const expiry =
+    process.env.SAMPLE_SHIELD_SIGNUP_FN_EMAIL_VERIFICATION_EXPIRY || 10;
+  console.log(`verification code expiry ${expiry} minutes`);
   const email_verification_code = String(
     Math.floor(100000 + Math.random() * 900000)
   );
-  const email_verification_expiry = new Date();
-  email_verification_expiry.setMinutes(
-    email_verification_expiry.getMinutes() +
-      process.env.email_verification_expiry || 10
+  const currentTime = new Date();
+  const email_verification_expiry = new Date(
+    currentTime.getTime() + expiry * 60 * 1000
   );
   return { email_verification_code, email_verification_expiry };
 };
 
-function sendEmailVerificationCode({ email, email_verification_code }) {
-  return sendMail({
-    emailTo: email,
-    Subject: "verification code for your account",
-    Text: email_verification_code,
-    Html: email_verification_code,
-  });
-}
-
+/**
+ *
+ * @param {*} req
+ * @param {*} res
+ * @returns
+ */
 const sample_shield_signup_fn = async (req, res) => {
   const schema = joi.object({
     email: joi.string().email().required(),
@@ -65,12 +74,14 @@ const sample_shield_signup_fn = async (req, res) => {
     provider_source: joi.string().required(),
     acceptTerms: joi.boolean().required(),
   });
+
   const providerIdsMap = {
     google: "",
     linkedin: "",
     twitter: "",
     shield: "4",
   };
+
   const { prisma, getBody, sendResponse } = await shared.getShared();
   // health check
   if (req.params["health"] === "health") {
@@ -78,99 +89,110 @@ const sample_shield_signup_fn = async (req, res) => {
     return;
   }
 
-  // Add your code here
   try {
-    let userProviderUpdate;
-
     const body = await getBody(req);
-    const { value, error } = schema.validate(body);
+    const { value: validatedValues, error } = schema.validate(body);
 
     if (error) {
-      const _d = {
+      sendResponse(res, 400, {
         err: true,
         msg: error.details[0].message,
         data: { errors: [...error.details] },
-      };
-      sendResponse(res, 400, _d);
+      });
       return;
     }
 
-    const { email, password, provider_source, acceptTerms, username } = value;
+    const { email, password, provider_source, acceptTerms, username } =
+      validatedValues;
+
+    console.log("form data received and validated");
+    console.log(`email:${email}`);
+    console.log(`password satisfies constraints`);
+    console.log(`provider_source:${provider_source}`);
+    console.log(`acceptTerms:${acceptTerms}`);
+    console.log(`username:${username}`);
 
     const userData = await prisma.users.findFirst({ where: { email } });
-    console.log("USERDATA:", userData);
-    if (userData) {
-      let userproviderdata = await prisma.user_providers.findFirst({
-        where: { user_id: userData.id },
-      });
-      console.log("USERPROVIDERDATA:", userproviderdata);
-      if (!userproviderdata) userproviderdata = {};
-      if (userproviderdata.provider_id === providerIdsMap[provider_source]) {
-        sendResponse(res, 303, {
-          err: true,
-          msg: "Already SignedUp, please login!",
+    const userAlreadyExists = !!userData;
+    if (!userAlreadyExists) {
+      const { email_verification_code, email_verification_expiry } =
+        generateOTP();
+
+      await prisma.$transaction(async (tx) => {
+        const userDataPayload = await tx.users.create({
           data: {
-            user_name: userData.user_name,
-            email: userData.email,
+            email,
+            password: hashSync(password, 10),
+            email_verified: false,
+            email_verification_code,
+            email_verification_expiry,
+            user_id: username,
+            user_name: username,
+            full_name: "",
+            address1: "",
+            address2: "",
+            phone: "",
+            created_at: new Date(),
+            updated_at: new Date(),
+            deleted_at: new Date(),
+            opt_counter: 1,
           },
         });
-        return;
-      }
 
-      userProviderUpdate = {
-        where: { user_id: userData.id },
-        data: {
-          provider_id: providerIdsMap[provider_source],
-        },
-      };
+        await tx.user_providers.create({
+          data: {
+            user_id: userDataPayload.user_id,
+            provider_id: providerIdsMap[provider_source],
+          },
+        });
+
+        await sendMail({
+          to: email,
+          subject: "verification code for your account",
+          text: email_verification_code,
+          html: email_verification_code,
+        });
+      });
+      console.log(`OTP sent to ${email} successfully `);
+
+      sendResponse(res, 302, {
+        err: false,
+        msg: "otp successfully generated and send",
+        data: {},
+      });
+      return;
     }
-    const { email_verification_code, email_verification_expiry } =
-      generateOTP();
-    const userDataPayload = await prisma.users.create({
-      data: {
-        email,
-        password: hashSync(password, 10),
-        email_verified: false,
-        email_verification_code,
-        email_verification_expiry,
-        user_id: username, //
-        user_name: username,
-        full_name: "",
-        address1: "",
-        address2: "",
-        phone: "",
-        created_at: new Date(),
-        updated_at: new Date(),
-        deleted_at: new Date(),
-        opt_counter: 1,
-      },
+    // Email already exists in records
+    console.log(`User with email:${email} exists in records`);
+
+    const userproviderdata = await prisma.user_providers.findFirst({
+      where: { user_id: userData.id },
     });
 
-    console.log("USERDATAPAYLOAD&&&&&&:", userDataPayload);
-    if (!userProviderUpdate)
-      userProviderUpdate = {
+    if (userproviderdata?.provider_id === providerIdsMap[provider_source]) {
+      console.log(`User provider record for id:${userData.id} exists`);
+      console.log(`User already signed up with provider`);
+      sendResponse(res, 303, {
+        err: true,
+        msg: "Already SignedUp, please login!",
         data: {
-          user_id: userDataPayload.user_id,
-          provider_id: providerIdsMap[provider_source],
+          user_name: userData.user_name,
+          email: userData.email,
         },
-      };
-    const userProviderPayload = await prisma.user_providers.create(
-      userProviderUpdate
-    );
-
-    if (!(await sendEmailVerificationCode(email, email_verification_code))) {
-      sendResponse(res, 500, { err: true, msg: "server error", data: {} });
+      });
+      console.log("returned with 303");
       return;
     }
 
-    sendResponse(res, 302, {
-      err: false,
-      msg: "otp successfully generated and send",
-      data: {},
+    await prisma.user_providers.create({
+      data: {
+        user_id: userDataPayload.user_id,
+        provider_id: providerIdsMap[provider_source],
+      },
     });
   } catch (error) {
     console.log(error);
-    sendResponse(res, 200, { err: true, msg: error.message, data: {} });
+    sendResponse(res, 500, { err: true, msg: "server error", data: {} });
     return;
   }
 };
